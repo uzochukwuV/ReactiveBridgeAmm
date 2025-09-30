@@ -1,0 +1,888 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity >=0.8.0;
+
+import '../../../lib/reactive-lib/src/abstract-base/AbstractCallback.sol';
+import '../../../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol';
+
+interface ITokenOracleRegistry {
+    function convertAmount(
+        address tokenA, 
+        address tokenB, 
+        uint256 amountA,
+        uint8 decimalsA,
+        uint8 decimalsB
+    ) external view returns (uint256);
+    function tokenFeeds(address token) external view returns (address);
+}
+
+
+interface ERC20Decimals {
+    function decimals() external  view returns (uint8);
+}
+
+/**
+ * @title ReactiveBridge
+ * @notice Single contract deployed on both L1 and L2 for cross-chain token swaps
+ * @dev Event-driven reactive architecture
+ */
+contract ReactiveBridge is AbstractCallback {
+
+    // ============ STRUCTS ============
+
+    struct Order {
+        uint256 orderId;
+        uint256 originChain;
+        uint256 destinationChain;
+        address orderer;
+        bytes tokenConfig;
+        bytes orderConfig;
+        uint256 timestamp;
+        bool isSettled;
+        bool isCancelled;
+    }
+
+    struct TokenConfig {
+        address tokenDeposited;
+        address tokenRequested;
+        uint256 amountDeposited;
+        uint256 amountRequested;
+        uint256 amountDepositedRemaining;
+        uint256 amountRequestedRemaining;
+    }
+
+    struct OrderConfig {
+        uint256 minFillAmount;
+        uint256 duration;
+        uint256 slippage;
+        bool usePriceFeed;
+        uint256 premiumBps;      // NEW: Premium in basis points (e.g., 200 = 2%)
+        uint256 protocolFeeBps;  // NEW: Protocol fee in basis points (e.g., 30 = 0.3%)
+    }
+
+    struct FeeConfig {
+        uint256 protocolFeeBps;     // Global protocol fee
+        uint256 maxPremiumBps;      // Max premium LPs can set (e.g., 1000 = 10%)
+        address feeRecipient;       // Where protocol fees go
+        bool feeEnabled;            // Emergency fee toggle
+    }
+
+    struct FillOrder {
+        uint256 fillId;
+        uint256 orderId;
+        uint256 originChain;
+        address filler;
+        uint256 amountFilled;
+        bool finalized;
+        bool settled;
+    }
+
+
+    // ============ STATE VARIABLES ============
+    FeeConfig public feeConfig;
+
+    address public immutable owner;
+    ITokenOracleRegistry public oracleRegistry;
+
+    uint256 public orderIdCounter;
+    uint256 public fillIdCounter;
+
+    // Orders placed on this chain (L1 perspective)
+    mapping(uint256 => Order) public originOrders;
+
+    // Orders received from other chain (L2 perspective)
+    mapping(uint256 => mapping(uint256 => Order)) public destinationOrders; // originChain => orderId => Order
+
+    // Fill tracking
+    mapping(uint256 => FillOrder) public fills;
+
+    // User ledger
+    mapping(address => mapping(address => uint256)) public ledger;
+
+    // Chain/Token management
+    mapping(uint256 => bool) public supportedChains;
+    mapping(address => bool) public supportedTokens;
+    mapping(uint256 => mapping(address => bool)) public chainToTokens;
+
+    mapping(uint256 => mapping(address => address)) public originToCanonicalAddress;
+
+    // constants
+     uint256 public constant CROSS_CHAIN_BUFFER = 1800;
+
+    // ============ EVENTS ============
+    uint256 public constant REACTIVE_SUBSCRIPTION_ID = 1001;
+
+
+    event OrderPlaced(
+        uint256 indexed r_sub_Id,
+        uint256 indexed topicId,
+        uint256 indexed orderId,
+        uint256 originChain,
+        uint256 destinationChain,
+        address orderer,
+        bytes tokenConfig,
+        bytes orderConfig
+    );
+
+    event OrderReceived(
+        uint256 indexed topicId,
+        uint256  indexed orderId,
+        uint256 originChain
+    );
+
+    event OrderFilled(
+        uint256 indexed r_sub_Id,
+        uint256 indexed topicId,
+        uint256 indexed orderId,
+        uint256  fillId,
+        uint256 originChain,
+        uint256 destinationChain,
+        address filler,
+        uint256 amountFilled
+    );
+
+    event FillCompleted(
+        uint256 indexed r_sub_Id,
+        uint256 indexed topicId,
+        uint256 indexed orderId,
+        uint256  fillId,
+        uint256 originChain,
+        uint256 destinationChain,
+        address orderer,
+        address filler,
+        uint256 amountSent
+    );
+
+    event OrderFinalized(
+        uint256 indexed topicId,
+        uint256 indexed orderId,
+        uint256 fillId,
+        uint256 originChain,
+        uint256 destinationChain,
+        address indexed orderer,
+        uint256 amountSent
+    );
+
+    // ============ MODIFIERS ============
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "NOT_OWNER");
+        _;
+    }
+
+    // ============ CONSTRUCTOR ============
+
+    constructor(
+        address _callback_sender
+    ) AbstractCallback(_callback_sender) payable {
+        owner = 0x8AaEe2071A400cC60927e46D53f751e521ef4D35;
+        oracleRegistry = ITokenOracleRegistry(0x8Bd2038bc18c9156a6427bf704dEF80953Fb8Aca);
+        supportedChains[11155111]= true;
+        supportedTokens[0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238] = true;
+        chainToTokens[11155111][0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238] = true;
+        supportedTokens[0x779877A7B0D9E8603169DdbD7836e478b4624789] = true;
+        chainToTokens[11155111][0x779877A7B0D9E8603169DdbD7836e478b4624789] = true;
+
+        feeConfig = FeeConfig({
+          protocolFeeBps: 30,        // 0.3% protocol fee
+          maxPremiumBps: 1000,       // Max 10% premium
+          feeRecipient: owner,       // Owner receives fees initially
+          feeEnabled: true
+      });
+    }
+    event CallbackReceived(
+        address indexed origin,
+        address indexed sender,
+        address indexed reactive_sender
+    );
+
+
+    function callback(address sender)
+        external
+        authorizedSenderOnly
+        rvmIdOnly(sender)
+    {
+        emit CallbackReceived(
+            tx.origin,
+            msg.sender,
+            sender
+        );
+    }
+
+
+    event Received(
+        uint256 indexed r_sub_id,
+        address indexed origin,
+        uint256 indexed value
+    );
+
+    receive() external override payable {
+        emit Received(
+            REACTIVE_SUBSCRIPTION_ID,
+            tx.origin,
+            msg.value
+        );
+        payable(tx.origin).transfer(msg.value);
+    }
+
+    // ============ STEP 1: PLACE ORDER ON L1 ============
+
+    function placeOrder(
+        uint256 destinationChain,
+        address tokenDeposited,
+        address tokenRequested,
+        uint256 amountDeposited,
+        uint256 amountRequested,
+        uint256 minFillAmount,
+        uint256 duration,
+        uint256 slippage,
+        bool usePriceFeed,
+        uint256 premiumBps  // NEW: LP's premium (0-1000 bps = 0-10%)
+    ) external payable returns (uint256 orderId) {
+        require(premiumBps <= feeConfig.maxPremiumBps, "PREMIUM_TOO_HIGH");
+        require(supportedChains[destinationChain], "UNSUPPORTED_CHAIN");
+        require(supportedTokens[tokenDeposited], "UNSUPPORTED_TOKEN_DEPOSITED");
+        require(chainToTokens[destinationChain][tokenRequested], "UNSUPPORTED_TOKEN_REQUESTED");
+        require(amountDeposited > 0 && minFillAmount > 0, "ZERO_AMOUNT");
+
+        if (usePriceFeed) {
+            require(oracleRegistry.tokenFeeds(tokenDeposited) != address(0), "NO_FEED_DEPOSITED");
+            require(oracleRegistry.tokenFeeds(tokenRequested) != address(0), "NO_FEED_REQUESTED");
+        }
+
+        // Handle deposit
+        if (tokenDeposited == address(0)) {
+            require(msg.value >= amountDeposited, "INSUFFICIENT_ETH");
+            if (msg.value > amountDeposited) {
+                payable(msg.sender).transfer(msg.value - amountDeposited);
+            }
+        } else {
+            require(IERC20(tokenDeposited).transferFrom(msg.sender, address(this), amountDeposited), "TRANSFER_FAILED");
+        }
+
+        ledger[msg.sender][tokenDeposited] += amountDeposited;
+
+        // Pack configs to avoid stack too deep
+        bytes memory tokenConfig = abi.encode(
+            tokenDeposited,
+            tokenRequested,
+            amountDeposited,
+            amountRequested,
+            amountDeposited,
+            amountRequested // amountRemaining = amountRequested initially
+        );
+
+        bytes memory orderConfig = abi.encode(
+            minFillAmount, // minfill of requested
+            duration,
+            slippage,
+            usePriceFeed,
+            premiumBps,              // NEW
+            feeConfig.protocolFeeBps // NEW
+        );
+
+        orderId = ++orderIdCounter;
+        originOrders[orderId] = Order({
+            orderId: orderId,
+            originChain: block.chainid,
+            destinationChain: destinationChain,
+            orderer: msg.sender,
+            tokenConfig: tokenConfig,
+            orderConfig: orderConfig,
+            timestamp: block.timestamp,
+            isSettled: false,
+            isCancelled: false
+        });
+
+        emit OrderPlaced(
+            REACTIVE_SUBSCRIPTION_ID,
+            0,
+            orderId,
+            block.chainid,
+            originOrders[orderId].destinationChain,
+            msg.sender,
+            tokenConfig,
+            orderConfig
+        );
+    }
+
+    // ============ STEP 2: RECEIVE ORDER ON L2 (CALLBACK) ============
+
+    function callbackReceiveOrder(
+        address sender,
+        uint256 orderId,
+        uint256 originChain,
+        uint256 destinationChain,
+        address orderer,
+        bytes calldata tokenConfig,
+        bytes calldata orderConfig
+    )
+        external 
+        // authorizedSenderOnly
+        // rvmIdOnly(sender)
+    {
+        require(supportedChains[originChain], "UNSUPPORTED_ORIGIN");
+        require(destinationOrders[originChain][orderId].orderer == address(0), "ORDER_EXISTS");
+
+        destinationOrders[originChain][orderId] = Order({
+            orderId: orderId,
+            originChain: originChain,
+            destinationChain: destinationChain,
+            orderer: orderer,
+            tokenConfig: tokenConfig,
+            orderConfig: orderConfig,
+            timestamp: block.timestamp,
+            isSettled: false,
+            isCancelled: false
+        });
+
+        emit OrderReceived(1, orderId, originChain);
+    }
+
+    // ============ STEP 3: FILL ORDER ON L2 ============
+
+    function fillOrder(
+        uint256 originChain,
+        uint256 orderId,
+        uint256 amountRequestedToFill
+    ) external payable returns (uint256 fillId) {
+        Order memory order = destinationOrders[originChain][orderId];
+        require(order.orderer != address(0), "ORDER_NOT_FOUND");
+
+        // Decode token config
+        TokenConfig memory tConfig;
+        (
+            tConfig.tokenDeposited,
+            tConfig.tokenRequested,
+            tConfig.amountDeposited,
+            tConfig.amountRequested,
+            tConfig.amountDepositedRemaining,
+            tConfig.amountRequestedRemaining
+        ) = abi.decode(order.tokenConfig, (address, address, uint256, uint256, uint256, uint256));
+
+        // Decode order config
+        OrderConfig memory oConfig;
+        (
+            oConfig.minFillAmount,
+            oConfig.duration,
+            oConfig.slippage,
+            oConfig.usePriceFeed,
+            oConfig.premiumBps,
+            oConfig.protocolFeeBps
+        ) = abi.decode(order.orderConfig, (uint256, uint256, uint256, bool, uint256, uint256));
+
+        require(amountRequestedToFill >= oConfig.minFillAmount, "BELOW_MIN_FILL");
+        require(block.timestamp <= order.timestamp + oConfig.duration, "ORDER_EXPIRED");
+        // check if amount of requested token remaing is greater than amount to fill
+        require(tConfig.amountRequestedRemaining >= amountRequestedToFill, "INSUFFICIENT_AMOUNT");
+        require(!order.isCancelled, "ORDER_CANCELLED");
+
+        // Handle filler deposit
+        if (tConfig.tokenRequested == address(0)) {
+            require(msg.value >= amountRequestedToFill, "INSUFFICIENT_ETH");
+            if (msg.value > amountRequestedToFill) {
+                payable(msg.sender).transfer(msg.value - amountRequestedToFill);
+            }
+        } else {
+            require(IERC20(tConfig.tokenRequested).transferFrom(msg.sender, address(this), amountRequestedToFill), "TRANSFER_FAILED");
+        }
+
+        ledger[msg.sender][tConfig.tokenRequested] += amountRequestedToFill;
+
+        fillId = ++fillIdCounter;
+        fills[fillId] = FillOrder({
+            fillId: fillId,
+            orderId: orderId,
+            originChain: originChain,
+            filler: msg.sender,
+            amountFilled: amountRequestedToFill,
+            finalized: false,
+            settled: false
+        });
+
+        emit OrderFilled(
+            REACTIVE_SUBSCRIPTION_ID,
+            2,
+            orderId,
+            fillId,
+            originChain,
+            block.chainid,
+            msg.sender,
+            amountRequestedToFill
+        );
+    }
+
+    // ============ STEP 4: COMPLETE FILL ON L1 (CALLBACK) ============
+
+    function callbackCompleteFill(
+        address sender,
+        uint256 orderId,
+        uint256 fillId,
+        uint256 originChain,
+        uint256 destinationChain,
+        address filler,
+        uint256 amountFilled
+    )
+        external
+        // authorizedSenderOnly
+        // rvmIdOnly(sender)
+    {
+        Order memory order = originOrders[orderId];
+        require(order.orderer != address(0), "ORDER_NOT_FOUND");
+
+        // Decode configs
+        TokenConfig memory tConfig;
+        (
+            tConfig.tokenDeposited,
+            tConfig.tokenRequested,
+            tConfig.amountDeposited,
+            tConfig.amountRequested,
+            tConfig.amountDepositedRemaining,
+            tConfig.amountRequestedRemaining
+        ) = abi.decode(order.tokenConfig, (address, address, uint256, uint256, uint256, uint256));
+
+        OrderConfig memory oConfig;
+        (
+            oConfig.minFillAmount,
+            oConfig.duration,
+            oConfig.slippage,
+            oConfig.usePriceFeed,
+            oConfig.premiumBps,
+            oConfig.protocolFeeBps
+        ) = abi.decode(order.orderConfig, (uint256, uint256, uint256, bool, uint256, uint256));
+
+        
+
+        uint256 amountToSend;
+
+        // Calculate amount using price feed or fixed ratio
+        if (oConfig.usePriceFeed) {
+            uint256 baseAmountToSend;
+            // Convert: amountFilled (tokenRequested) -> tokenDeposited
+            if (tConfig.tokenDeposited != address(0) && tConfig.tokenRequested != address(0)) {
+                  baseAmountToSend = oracleRegistry.convertAmount(
+                    tConfig.tokenRequested,
+                    tConfig.tokenDeposited,
+                    amountFilled,
+                    ERC20Decimals(originToCanonicalAddress[originChain][tConfig.tokenRequested]).decimals(),
+                    ERC20Decimals(tConfig.tokenDeposited).decimals()
+                );
+            }else {
+                if (tConfig.tokenDeposited == address(0)) {
+                    baseAmountToSend = oracleRegistry.convertAmount(
+                    tConfig.tokenRequested,
+                    tConfig.tokenDeposited,
+                    amountFilled,
+                    ERC20Decimals(originToCanonicalAddress[originChain][tConfig.tokenRequested]).decimals(),
+                    18
+                );
+            } else {
+                    baseAmountToSend = oracleRegistry.convertAmount(
+                    tConfig.tokenRequested,
+                    tConfig.tokenDeposited,
+                    amountFilled,
+                    18,
+                    ERC20Decimals(tConfig.tokenDeposited).decimals()
+                );
+            }
+            }
+            // Slippage check on base amount BEFORE adding premium
+            uint256 expectedAmount = (tConfig.amountDeposited * amountFilled) / tConfig.amountRequested;
+            uint256 slippageTolerance = (expectedAmount * oConfig.slippage) / 10000;
+
+            require(
+                baseAmountToSend >= expectedAmount - slippageTolerance &&
+                baseAmountToSend <= expectedAmount + slippageTolerance,
+                "SLIPPAGE_EXCEEDED"
+            );
+
+            // Add premium AFTER slippage check (premium is intentional extra cost)
+            uint256 premiumAmount = (baseAmountToSend * oConfig.premiumBps) / 10000;
+            amountToSend = baseAmountToSend + premiumAmount;
+        } else {
+            // Fixed ratio
+            uint256 baseRatio = (tConfig.amountDeposited * amountFilled) / tConfig.amountRequested;
+            uint256 premiumAmount = (baseRatio * oConfig.premiumBps) / 10000;
+            amountToSend = baseRatio + premiumAmount;
+
+        }
+        uint256 protocolFee = (amountToSend * oConfig.protocolFeeBps) / 10000;
+        uint256 finalAmountToSend = amountToSend - protocolFee;
+
+        require(ledger[order.orderer][tConfig.tokenDeposited] >= amountToSend, "INSUFFICIENT_LEDGER");
+
+        // Send tokens to L2 filler
+        ledger[order.orderer][tConfig.tokenDeposited] -= amountToSend; // we deduct whole but send subtracted fees
+
+        if (tConfig.tokenDeposited == address(0)) {
+            payable(filler).transfer(finalAmountToSend);
+        } else {
+            require(IERC20(tConfig.tokenDeposited).transfer(filler, finalAmountToSend), "TRANSFER_FAILED");
+        }
+
+        // Update remaining amount
+        tConfig.amountDepositedRemaining -= amountToSend;
+        tConfig.amountRequestedRemaining -= amountFilled;
+        originOrders[orderId].tokenConfig = abi.encode(
+            tConfig.tokenDeposited,
+            tConfig.tokenRequested,
+            tConfig.amountDeposited,
+            tConfig.amountRequested,
+            tConfig.amountDepositedRemaining,
+            tConfig.amountRequestedRemaining
+        );
+
+        emit FillCompleted(
+            REACTIVE_SUBSCRIPTION_ID,
+            3,
+            orderId,
+            fillId,
+            originChain,
+            destinationChain,
+            order.orderer,
+            filler,
+            amountToSend
+        );
+    }
+
+    // ============ STEP 5: FINALIZE ORDER ON L2 (CALLBACK) ============
+
+    function callbackFinalizeOrder(
+        address sender,
+        uint256 orderId,
+        uint256 fillId,
+        uint256 originChain,
+        uint256 destinationChain,
+        address orderer,
+        uint256 amountSent
+    )
+        external
+        // authorizedSenderOnly
+        // rvmIdOnly(sender)
+    {
+        FillOrder storage fill = fills[fillId];
+        require(fill.fillId == fillId, "FILL_NOT_FOUND");
+        require(!fill.settled, "ALREADY_SETTLED");
+
+        Order memory order = destinationOrders[originChain][orderId];
+        
+        TokenConfig memory tConfig;
+        (
+            tConfig.tokenDeposited,
+            tConfig.tokenRequested,
+            tConfig.amountDeposited,
+            tConfig.amountRequested,
+            tConfig.amountDepositedRemaining,
+            tConfig.amountRequestedRemaining
+        ) = abi.decode(order.tokenConfig, (address, address, uint256, uint256, uint256, uint256));
+
+        require(ledger[fill.filler][tConfig.tokenRequested] >= fill.amountFilled, "INSUFFICIENT_LEDGER");
+        uint256 protocolFee = (fill.amountFilled * feeConfig.protocolFeeBps) / 10000;
+        uint256 amountL1OrderwillRecieve = fill.amountFilled - protocolFee;
+
+        // Send L2 tokens to L1 orderer
+        ledger[fill.filler][tConfig.tokenRequested] -= fill.amountFilled;
+
+        if (tConfig.tokenRequested == address(0)) {
+            payable(order.orderer).transfer(amountL1OrderwillRecieve);
+        } else {
+            require(IERC20(tConfig.tokenRequested).transfer(order.orderer, amountL1OrderwillRecieve), "TRANSFER_FAILED");
+        }
+
+        // check if amount remaining is zero then mark as completed or settled
+        if (tConfig.amountDepositedRemaining == 0) {
+            // settled order
+            order.isSettled = true;
+            order.isCancelled = false;
+            
+        } else {
+            // not settled
+
+        }
+        order.tokenConfig = abi.encode(
+            tConfig.tokenDeposited,
+            tConfig.tokenRequested,
+            tConfig.amountDeposited,
+            tConfig.amountRequested,
+            tConfig.amountDepositedRemaining,
+            tConfig.amountRequestedRemaining
+        );
+
+        destinationOrders[originChain][orderId] = order;
+
+        fill.settled = true;
+        fill.finalized = true;
+        fills[fillId] = fill;
+
+        emit OrderFinalized(
+            4,
+            orderId,
+            fillId,
+            originChain,
+            destinationChain,
+            orderer,
+            fill.amountFilled
+        );
+    }
+
+
+    // step 6, request cancellation from origin l1 chain if not passed expiration
+    event CancellationRequested(
+        uint256 indexed r_sub_Id,
+        uint256 indexed topicId,
+        uint256 indexed orderId, 
+        uint256 originChain, 
+        uint256 destinationChain, 
+        address orderer
+    );
+    event OrderCancelled(uint256 indexed topicId,uint256 orderId, address orderer, uint256 originChain, uint256 destinationChain, bool isCancelled);
+    event OrderCancelledOnL2(
+        uint256 indexed r_sub_Id,
+        uint256 indexed topicId,
+        uint256 indexed orderId, 
+        address orderer, 
+        uint256 originChain, 
+        uint256 destinationChain, 
+        bool isCancelled
+    );
+
+
+    function requestCancellation(uint256 orderId) external {
+        Order memory order = originOrders[orderId];
+        require(order.orderer == msg.sender, "NOT_ORDERER");
+        require(order.orderer != address(0), "ORDER_NOT_FOUND");
+        require(order.isCancelled != true, "ORDER_NOT_ACTIVE");
+              
+        
+
+        emit CancellationRequested(
+            REACTIVE_SUBSCRIPTION_ID,
+            5, orderId,order.originChain, order.destinationChain, msg.sender);
+    }
+
+    // step seven , mark order as canceled in destination chain
+    function markOrderAsCanceledCallbackL2(address sender, uint256 orderId, uint256 originChain, uint256 destinationChain, address orderer) external
+    // authorizedSenderOnly
+    // rvmIdOnly(sender)
+    {
+        // get order
+        Order memory order = destinationOrders[originChain][orderId];
+        require(order.orderer == orderer, "NOT_ORDERER");
+        require(order.destinationChain == destinationChain, "NOT_DESTINATION_CHAIN");
+        require(order.originChain == originChain, "NOT_ORIGIN_CHAIN");
+        order.isCancelled = true;
+
+        destinationOrders[originChain][orderId] = order;
+        emit OrderCancelledOnL2(
+            REACTIVE_SUBSCRIPTION_ID,
+            6, orderId, order.orderer, order.originChain, order.destinationChain, order.isCancelled);
+    }
+
+
+    // step 8 mark order cancelled in origin l1 chain and release funds
+    function markOrderAsCanceledCallbackL1(
+        address sender,
+        uint256 orderId, 
+        uint256 originChain, 
+        uint256 destinationChain, 
+        bool isCancelled
+    )
+    external 
+    // authorizedSenderOnly
+    // rvmIdOnly(sender)
+     {
+        Order storage order = originOrders[orderId];
+        require(isCancelled == true, "NOT_CANCELLED");
+        order.isCancelled = true;
+
+        // check amount remaining and release funds release funds to orderer
+        TokenConfig memory tConfig;
+        (
+            tConfig.tokenDeposited,
+            tConfig.tokenRequested,
+            tConfig.amountDeposited,
+            tConfig.amountRequested,
+            tConfig.amountDepositedRemaining,
+            tConfig.amountRequestedRemaining
+        ) = abi.decode(order.tokenConfig, (address, address, uint256, uint256, uint256, uint256));
+        require(tConfig.amountDepositedRemaining <= ledger[order.orderer][tConfig.tokenDeposited], "LEDGER_DOES_NOT_MATCH");
+
+        ledger[order.orderer][tConfig.tokenDeposited] -= tConfig.amountDepositedRemaining;
+        if (tConfig.tokenDeposited == address(0)) {
+            payable(order.orderer).transfer(tConfig.amountDepositedRemaining);
+        } else {
+            require(IERC20(tConfig.tokenDeposited).transfer(order.orderer, tConfig.amountDepositedRemaining), "TRANSFER_FAILED");
+        }
+
+        emit OrderCancelled(7, orderId,order.orderer, order.originChain, order.destinationChain, order.isCancelled);
+    }
+
+    // uint256 public constant CROSS_CHAIN_BUFFER = 1800;
+    event CanceldExpiredOrder(uint256 topicId, uint256 orderId, address orderer, uint256 destinationChain);
+    // cancel and take expired orders
+    function cancelExpiredOrder(uint256 orderId) external {
+        Order storage order = originOrders[orderId];
+        require(order.orderer == msg.sender);
+
+        OrderConfig memory oConfig;
+        (
+            oConfig.minFillAmount,
+            oConfig.duration,
+            oConfig.slippage,
+            oConfig.usePriceFeed,
+            oConfig.premiumBps,
+            oConfig.protocolFeeBps
+        ) = abi.decode(order.orderConfig, (uint256, uint256, uint256, bool, uint256, uint256));
+        require(block.timestamp > order.timestamp + oConfig.duration + CROSS_CHAIN_BUFFER, "NOT_EXPIRED_YET");
+        require(order.isCancelled != true, "ALREADY_CANCELED");
+        order.isCancelled = true;
+
+        // check amount remaining and release funds release funds to orderer
+        TokenConfig memory tConfig;
+        (
+            tConfig.tokenDeposited,
+            tConfig.tokenRequested,
+            tConfig.amountDeposited,
+            tConfig.amountRequested,
+            tConfig.amountDepositedRemaining,
+            tConfig.amountRequestedRemaining
+        ) = abi.decode(order.tokenConfig, (address, address, uint256, uint256, uint256, uint256));
+        require(tConfig.amountDepositedRemaining <= ledger[order.orderer][tConfig.tokenDeposited], "LEDGER_DOES_NOT_MATCH");
+        if (tConfig.tokenDeposited == address(0)) {
+            payable(order.orderer).transfer(tConfig.amountDepositedRemaining);
+        } else {
+            require(IERC20(tConfig.tokenDeposited).transfer(order.orderer, tConfig.amountDepositedRemaining), "TRANSFER_FAILED");
+        }
+
+        emit CanceldExpiredOrder(8, order.orderId, order.orderer, order.destinationChain);
+    }
+
+
+    // test oracle
+    function testOracle(address tokenA, address tokenB, uint256 amountA ) external view  returns (uint256) {
+        return oracleRegistry.convertAmount(tokenA, tokenB, amountA, ERC20Decimals(tokenA).decimals(),
+                ERC20Decimals(tokenB).decimals() );
+    }
+
+    
+
+  function calculateFillCost(
+      uint256 orderId,
+      uint256 amountToFill
+  ) external view returns (
+      uint256 baseCost,
+      uint256 premium,
+      uint256 protocolFee,
+      uint256 totalCost
+  ) {
+      Order memory order = originOrders[orderId];
+      TokenConfig memory tConfig;
+      (
+            tConfig.tokenDeposited,
+            tConfig.tokenRequested,
+            tConfig.amountDeposited,
+            tConfig.amountRequested,
+            tConfig.amountDepositedRemaining,
+            tConfig.amountRequestedRemaining
+        ) = abi.decode(order.tokenConfig, (address, address, uint256, uint256,       
+  uint256, uint256));
+      OrderConfig memory oConfig;
+        (
+            oConfig.minFillAmount,
+            oConfig.duration,
+            oConfig.slippage,
+            oConfig.usePriceFeed,
+            oConfig.premiumBps,
+            oConfig.protocolFeeBps
+        )  = abi.decode(order.orderConfig, (uint256, uint256, uint256, bool,
+  uint256, uint256));
+
+      if (oConfig.usePriceFeed) {
+          baseCost = oracleRegistry.convertAmount(
+              tConfig.tokenRequested,
+              tConfig.tokenDeposited,
+              amountToFill,
+              getTokenDecimals(tConfig.tokenRequested),
+              getTokenDecimals(tConfig.tokenDeposited)
+          );
+      } else {
+          baseCost = (tConfig.amountDeposited * amountToFill) / tConfig.amountRequested;
+      }
+
+      premium = (baseCost * oConfig.premiumBps) / 10000;
+      uint256 totalBeforeFee = baseCost + premium;
+      protocolFee = (totalBeforeFee * oConfig.protocolFeeBps) / 10000;
+      totalCost = totalBeforeFee - protocolFee;
+  }
+  function getTokenDecimals(address token) internal view returns (uint8) {
+      if (token == address(0)) {
+          return 18; // ETH decimals
+      }
+      return ERC20Decimals(token).decimals();
+  }
+
+    // ============ ADMIN FUNCTIONS ============
+    function withdrawProtocolFees(address token) external onlyOwner {
+      uint256 balance;
+
+      if (token == address(0)) {
+          balance = address(this).balance;
+          require(balance > 0, "NO_FEES");
+          payable(feeConfig.feeRecipient).transfer(balance);
+      } else {
+          balance = IERC20(token).balanceOf(address(this));
+          require(balance > 0, "NO_FEES");
+          require(IERC20(token).transfer(feeConfig.feeRecipient, balance), "TRANSFER_FAILED");
+      }
+  }
+
+    function updateOracleRegistry(address _newRegistry) external onlyOwner {
+        require(_newRegistry != address(0), "ZERO_ADDRESS");
+        oracleRegistry = ITokenOracleRegistry(_newRegistry);
+    }
+
+    function addSupportedChain(uint256 chainId) external onlyOwner {
+        supportedChains[chainId] = true;
+    }
+
+    function removeSupportedChain(uint256 chainId) external onlyOwner {
+        supportedChains[chainId] = false;
+    }
+
+    function addSupportedToken(address token) external onlyOwner {
+        require(token != address(0), "ZERO_ADDRESS");
+        supportedTokens[token] = true;
+    }
+
+    function removeSupportedToken(address token) external onlyOwner {
+        supportedTokens[token] = false;
+    }
+
+    function addChainToken(uint256 chainId, address token) external onlyOwner {
+        require(supportedChains[chainId], "UNSUPPORTED_CHAIN");
+        require(token != address(0), "ZERO_ADDRESS");
+        chainToTokens[chainId][token] = true;
+    }
+
+    function removeChainToken(uint256 chainId, address token) external onlyOwner {
+        chainToTokens[chainId][token] = false;
+    }
+
+    function setOriginToCanonicalMapping(
+        uint256 originChain,
+        address originToken,
+        address canonicalToken
+    ) external onlyOwner {
+        require(originToken != address(0), "ZERO_ORIGIN_TOKEN");
+        require(canonicalToken != address(0), "ZERO_CANONICAL_TOKEN");
+        originToCanonicalAddress[originChain][originToken] = canonicalToken;
+    }
+
+    function emergencyWithdraw() external onlyOwner {
+        payable(owner).transfer(address(this).balance);
+    }
+
+    function emergencyWithdrawToken(address token, uint256 amount) external onlyOwner {
+        require(IERC20(token).transfer(owner, amount), "TRANSFER_FAILED_");
+    }
+
+}

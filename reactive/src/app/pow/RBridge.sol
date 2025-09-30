@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: UNLICENSED
+
+pragma solidity >=0.8.0;
+
+import '../../../lib/reactive-lib/src/interfaces/IReactive.sol';
+import '../../../lib/reactive-lib/src/abstract-base/AbstractReactive.sol';
+import '../../../lib/reactive-lib/src/interfaces/ISystemContract.sol';
+
+/**
+ * @title ReactiveBridgeOrchestrator
+ * @notice Orchestrates cross-chain events between L1 and L2 bridge contracts
+ * @dev Listens to events from both chains and triggers appropriate callbacks
+ * 
+ * Event Flow:
+ * topic_1 == 0: OrderPlaced (L1 → L2) - Step 1→2
+ * topic_1 == 2: OrderFilled (L2 → L1) - Step 3→4  
+ * topic_1 == 3: FillCompleted (L1 → L2) - Step 4→5
+ */
+contract ReactiveBridgeOrchestrator is IReactive, AbstractReactive {
+
+    uint64 private constant GAS_LIMIT = 10000000;
+    uint256 public constant REACTIVE_SUBSCRIPTION_ID = 1001;
+
+    mapping(uint256 => address) public chainToContract;
+
+    constructor(
+        address _service,
+        uint256[] memory _chainIds,
+        address[] memory _contracts
+    ) payable {
+        service = ISystemContract(payable(_service));
+
+        if (!vm) {
+            require(_chainIds.length == _contracts.length, "LENGTH_MISMATCH");
+            
+            for (uint i = 0; i < _chainIds.length; i++) {
+                chainToContract[_chainIds[i]] = _contracts[i];
+                
+                service.subscribe(
+                    _chainIds[i],
+                    _contracts[i],
+                    REACTIVE_IGNORE,
+                    REACTIVE_SUBSCRIPTION_ID,
+                    REACTIVE_IGNORE,
+                    REACTIVE_IGNORE
+                );
+            }
+        }
+    }
+
+    function react(LogRecord calldata log) external vmOnly {
+        // Topic 1 is reactive subid
+        // Topic 2 is event topic id
+        // Topic 3 is order id
+        if (log.topic_3 >= 0.001 ether) {
+            bytes memory payload = abi.encodeWithSignature("callback(address)", address(0));
+            emit Callback(log.topic_2, chainToContract[log.topic_2], GAS_LIMIT, payload);
+        }
+        
+        // ============ STEP 1→2: OrderPlaced on L1, send to L2 ============
+        if (log.topic_2 == 0) {
+
+            // event OrderPlaced(topicId=0, orderId, originChain, destinationChain, orderer, tokenConfig, orderConfig)
+            (
+                uint256 originChain,
+                uint256 destinationChain,
+                address orderer,
+                bytes memory tokenConfig,
+                bytes memory orderConfig
+            ) = abi.decode(
+                log.data,
+                (uint256, uint256, address, bytes, bytes)
+            );
+
+            bytes memory payload = abi.encodeWithSignature(
+                "callbackReceiveOrder(address,uint256,uint256,uint256,address,bytes,bytes)",
+                address(0),
+                log.topic_3, // topic 3 is always orderId
+                originChain,
+                destinationChain,
+                orderer,
+                tokenConfig,
+                orderConfig
+            );
+
+            emit Callback(
+                destinationChain,
+                chainToContract[destinationChain],
+                GAS_LIMIT,
+                payload
+            );
+        }
+
+        // ============ STEP 3→4: OrderFillRequested on L2, send to L1 ============
+        else if (log.topic_2 == 2) {
+            // event OrderFillReuested(topicId=2, orderId, fillId, originChain, destinationChain, filler, amountFilled)
+            (
+                uint256 fillId,
+                uint256 originChain,
+                uint256 destinationChain,
+                address filler,
+                uint256 amountFilled
+            ) = abi.decode(
+                log.data,
+                (uint256, uint256, uint256, address, uint256)
+            );
+
+            bytes memory payload = abi.encodeWithSignature(
+                "callbackCompleteFill(address,uint256,uint256,uint256,uint256,address,uint256)",
+                address(0),
+                log.topic_3,
+                fillId,
+                originChain,
+                destinationChain,
+                filler,
+                amountFilled
+            );
+
+            emit Callback(
+                originChain,
+                chainToContract[originChain],
+                GAS_LIMIT,
+                payload
+            );
+        }
+
+        // ============ STEP 4→5: FillCompleted on L1, send to L2 ============
+        else if (log.topic_2 == 3) {
+            // event FillCompleted(topicId=3, orderId, fillId, originChain, destinationChain, orderer, filler, amountSent)
+            (
+                uint256 fillId,
+                uint256 originChain,
+                uint256 destinationChain,
+                address orderer,
+                address filler,
+                uint256 amountSent
+            ) = abi.decode(
+                log.data,
+                (uint256, uint256, uint256, address, address, uint256)
+            );
+
+            bytes memory payload = abi.encodeWithSignature(
+                "callbackFinalizeOrder(address,uint256,uint256,uint256,uint256,address,uint256)",
+                address(0),
+                log.topic_3,
+                fillId,
+                originChain,
+                destinationChain,
+                orderer,
+                amountSent
+            );
+
+            emit Callback(
+                destinationChain,
+                chainToContract[destinationChain],
+                GAS_LIMIT,
+                payload
+            );
+        }
+
+        // ============ STEP 6+7: canceled requested on L1, send to L2 ============
+        else if (log.topic_2 == 5) {
+            (uint256 originChain, uint256 destinationChain, address orderer)
+            = abi.decode(
+                log.data,
+                (uint256, uint256, address)
+            );
+
+            bytes memory payload = abi.encodeWithSignature(
+                "markOrderAsCanceledCallbackL2(address,uint256,uint256,uint256,address)",
+                address(0),
+                log.topic_3,
+                originChain,
+                destinationChain,
+                orderer
+            );
+            emit Callback(
+                destinationChain,
+                chainToContract[destinationChain],
+                GAS_LIMIT,
+                payload
+            );
+        }
+        // ============ STEP 4→5: canceled on L2, send to L1 ============
+
+        else if (log.topic_2 == 6) {
+            (address orderer, uint256 originChain, uint256 destinationChain, bool isCancelled)
+            = abi.decode(
+                log.data,
+                (address, uint256, uint256 ,bool)
+            );
+
+            bytes memory payload = abi.encodeWithSignature(
+                "markOrderAsCanceledCallbackL1(address,uint256,uint256,uint256,bool)",
+                address(0),
+                log.topic_3,
+                originChain,
+                destinationChain,
+                isCancelled
+            );
+            emit Callback(
+                originChain,
+                chainToContract[originChain],
+                GAS_LIMIT,
+                payload
+            );
+        }
+
+    }
+
+    function emergencyWithdraw(address owner) external  {
+        payable(owner).transfer(address(this).balance);
+    }
+}
