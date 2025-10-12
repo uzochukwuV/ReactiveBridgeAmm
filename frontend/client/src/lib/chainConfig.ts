@@ -13,8 +13,8 @@ export interface ChainConfig {
 }
 
 export const SUPPORTED_CHAINS: Record<number, ChainConfig> = {
-  64165: {
-    id: 64165,
+  14601: {
+    id: 14601,
     name: "Sonic Testnet",
     rpcUrl: "https://rpc.testnet.soniclabs.com",
     explorer: "https://testnet.sonicscan.org",
@@ -23,7 +23,7 @@ export const SUPPORTED_CHAINS: Record<number, ChainConfig> = {
       symbol: "S",
       decimals: 18,
     },
-    bridgeContract: "0x0000000000000000000000000000000000000000",
+    bridgeContract: "0x0000000000000000000000000000000000000000", // UPDATE AFTER DEPLOYMENT
     icon: "◆",
   },
   84532: {
@@ -36,7 +36,20 @@ export const SUPPORTED_CHAINS: Record<number, ChainConfig> = {
       symbol: "ETH",
       decimals: 18,
     },
-    bridgeContract: "0x0000000000000000000000000000000000000000",
+    bridgeContract: "0x0000000000000000000000000000000000000000", // UPDATE AFTER DEPLOYMENT
+    icon: "●",
+  },
+  11155111: {
+    id: 11155111,
+    name: "Sepolia",
+    rpcUrl: "https://sepolia.org",
+    explorer: "https://sepolia.etherscan.org",
+    nativeCurrency: {
+      name: "Ethereum",
+      symbol: "ETH",
+      decimals: 18,
+    },
+    bridgeContract: "0xBC3B38142f60D4A3FbE23B70B4723FB0284161d1", // L1V3Contract address
     icon: "●",
   },
 };

@@ -357,7 +357,7 @@ Far superior to traditional bridge LP yields (0-2%)!
 ## 📞 Contact
 
 **Website**: https://powbridge.io
-**Email**: team@powbridge.io
+**Email**: vic.ezealor@gmail.com
 **Twitter**: @PowBridge
 **Discord**: discord.gg/powbridge
 **GitHub**: github.com/powbridge

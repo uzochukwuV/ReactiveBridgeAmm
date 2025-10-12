@@ -8,6 +8,32 @@ export interface Token {
 }
 
 export const TOKENS: Record<number, Token[]> = {
+   11155111: [
+    {
+      address: "0x779877A7B0D9E8603169DdbD7836e478b4624789",
+      symbol: "Link",
+      name: "Link",
+      decimals: 18,
+      logo: "◆",
+      chainId: 11155111,
+    },
+    {
+      address: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+      symbol: "USDC",
+      name: "USD Coin",
+      decimals: 6,
+      logo: "$",
+      chainId: 11155111,
+    },
+    {
+      address: "0x0000000000000000000000000000000000000000",
+      symbol: "ETH",
+      name: "Etherum",
+      decimals: 18,
+      logo: "Ξ",
+      chainId: 11155111,
+    },
+  ],
   64165: [
     {
       address: "0x0000000000000000000000000000000000000000",
@@ -74,7 +100,7 @@ export function getTokensByChainId(chainId: number): Token[] {
 export function getTokenByAddress(chainId: number, address: string): Token | undefined {
   const tokens = getTokensByChainId(chainId);
   return tokens.find(
-    (t) => t.address.toLowerCase() === address.toLowerCase()
+    (t) => t.address.toLowerCase() === address?.toLowerCase()
   );
 }
 

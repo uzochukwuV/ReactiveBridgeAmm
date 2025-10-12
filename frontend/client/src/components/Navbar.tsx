@@ -6,8 +6,10 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { formatAddress, SUPPORTED_CHAINS } from "@/lib/chainConfig";
+import { formatAddress } from "@/lib/chainConfig";
 import { useAccount, useConnect, useDisconnect, useSwitchChain } from "wagmi";
+import { useNetworkState, useBridgeState } from "@/hooks/useAppState";
+import { useEffect } from "react";
 
 export default function Navbar() {
   const [location] = useLocation();
@@ -15,9 +17,25 @@ export default function Navbar() {
   const { connectors, connect } = useConnect();
   const { disconnect } = useDisconnect();
   const { switchChain } = useSwitchChain();
+  const { networkType, setNetworkType, availableChains, isTestnet } = useNetworkState();
+  const { setFromChain, fromChain } = useBridgeState();
+
+  // Auto-switch wallet chain when network type changes
+  useEffect(() => {
+    if (isConnected && Object.keys(availableChains).length > 0) {
+      const chainIds = Object.keys(availableChains).map(Number);
+      const defaultChain = chainIds[0];
+      
+      if (defaultChain && chain?.id !== defaultChain) {
+        switchChain({ chainId: defaultChain });
+        setFromChain(defaultChain);
+      }
+    }
+  }, [networkType]); // Only depend on networkType to avoid loops
 
   const connectWallet = () => {
-    const injectedConnector = connectors.find((c) => c.id === "injected");
+    const injectedConnector = connectors.find((c) => c.id === "metaMask");
+    console.log(connectors)
     if (injectedConnector) {
       connect({ connector: injectedConnector });
     }
@@ -28,10 +46,20 @@ export default function Navbar() {
   };
 
   const handleSwitchChain = (chainId: number) => {
+    // Update both wallet and app state
     switchChain({ chainId });
+    setFromChain(chainId);
+    // setNetworkType ? 'testnet' : 'mainnet')
+    console.log(availableChains)
   };
 
-  const currentChainId = chain?.id || 64165;
+  const handleSwtitchNwtwork = (_networkType: string) => {
+    setNetworkType(_networkType);
+    switchChain({ chainId: Object.keys(availableChains)[0]});
+    setFromChain(Object.keys(availableChains)[0]);
+  }
+
+  const currentChainId = fromChain;
 
   return (
     <nav className="fixed top-0 left-0 right-0 z-50 backdrop-blur-xl bg-background/80 border-b border-border">
@@ -69,6 +97,18 @@ export default function Navbar() {
                 ORDERS
               </div>
             </Link>
+            <Link href="/liquidity">
+              <div
+                className={`px-4 py-2 text-sm font-medium rounded-md hover-elevate cursor-pointer ${
+                  location === "/liquidity"
+                    ? "text-primary border-b-2 border-primary"
+                    : "text-muted-foreground"
+                }`}
+                data-testid="link-liquidity"
+              >
+                LIQUIDITY
+              </div>
+            </Link>
             <Link href="/market-maker">
               <div
                 className={`px-4 py-2 text-sm font-medium rounded-md hover-elevate cursor-pointer ${
@@ -84,6 +124,28 @@ export default function Navbar() {
           </div>
 
           <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1 border rounded-md p-1">
+              <Button
+                variant={networkType === 'testnet' ? 'default' : 'ghost'}
+                size="sm"
+                onClick={() => {
+                  handleSwtitchNwtwork('testnet');
+                }}
+                className="h-7 px-2 text-xs"
+              >
+                Testnet
+              </Button>
+              <Button
+                variant={networkType === 'mainnet' ? 'default' : 'ghost'}
+                size="sm"
+                onClick={() => {
+                  handleSwtitchNwtwork('mainnet');
+                }}
+                className="h-7 px-2 text-xs"
+              >
+                Mainnet
+              </Button>
+            </div>
             {isConnected && (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -93,14 +155,14 @@ export default function Navbar() {
                     className="gap-2"
                     data-testid="button-chain-switcher"
                   >
-                    <span>{SUPPORTED_CHAINS[currentChainId]?.icon || "◆"}</span>
+                    <span>{availableChains[currentChainId]?.icon || "◆"}</span>
                     <span className="hidden sm:inline">
-                      {SUPPORTED_CHAINS[currentChainId]?.name || chain?.name || "Unknown"}
+                      {availableChains[currentChainId]?.name || chain?.name || "Unknown"}
                     </span>
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-48">
-                  {Object.values(SUPPORTED_CHAINS).map((supportedChain) => (
+                  {Object.values(availableChains).map((supportedChain) => (
                     <DropdownMenuItem
                       key={supportedChain.id}
                       onClick={() => handleSwitchChain(supportedChain.id)}
@@ -109,7 +171,7 @@ export default function Navbar() {
                     >
                       <span>{supportedChain.icon}</span>
                       <span>{supportedChain.name}</span>
-                      {currentChainId === supportedChain.id && (
+                      {chain?.id === supportedChain.id && (
                         <span className="ml-auto text-primary">✓</span>
                       )}
                     </DropdownMenuItem>
@@ -134,7 +196,7 @@ export default function Navbar() {
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     onClick={() => {
-                      const explorer = SUPPORTED_CHAINS[currentChainId]?.explorer || chain?.blockExplorers?.default.url;
+                      const explorer = availableChains[currentChainId]?.explorer || chain?.blockExplorers?.default.url;
                       if (explorer) {
                         window.open(`${explorer}/address/${address}`, "_blank");
                       }

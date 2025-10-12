@@ -1,5 +1,5 @@
 import { http, createConfig } from "wagmi";
-import { baseSepolia } from "wagmi/chains";
+import { baseSepolia, sepolia } from "wagmi/chains";
 import { injected, walletConnect } from "wagmi/connectors";
 
 export const sonicTestnet = {
@@ -20,10 +20,10 @@ export const sonicTestnet = {
   testnet: true,
 } as const;
 
-const projectId = "b36df91dc51c4a6c1b01ef9b4e217a55";
+const projectId = "001f5fa4dd2f2b16662704bcaa5d21d5";
 
 export const config = createConfig({
-  chains: [sonicTestnet, baseSepolia],
+  chains: [sonicTestnet, baseSepolia, sepolia],
   connectors: [
     injected({ target: "metaMask" }),
     walletConnect({
@@ -34,6 +34,7 @@ export const config = createConfig({
   transports: {
     [sonicTestnet.id]: http(),
     [baseSepolia.id]: http(),
+    [sepolia.id]: http(),
   },
 });
 

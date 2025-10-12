@@ -11,6 +11,7 @@ import Orders from "@/pages/Orders";
 import OrderDetail from "@/pages/OrderDetail";
 import MarketMaker from "@/pages/MarketMaker";
 import NotFound from "@/pages/not-found";
+import Liquidity from "./pages/Liquidity";
 
 function Router() {
   return (
@@ -20,6 +21,7 @@ function Router() {
       <Route path="/orders" component={Orders} />
       <Route path="/orders/:id" component={OrderDetail} />
       <Route path="/market-maker" component={MarketMaker} />
+      <Route path="/liquidity" component={Liquidity} />
       <Route component={NotFound} />
     </Switch>
   );
