@@ -49,8 +49,8 @@ export default function MarketMaker() {
   const { createL2Order, isPending: isFilling } = useCreateL2Order(selectedChain);
 
   // Reactive network listener
-  const { isListening, stopListening } = useReactiveListener({
-    rvmId: "0x1", // Update with correct RVM ID
+  const { isListening, stopListening, } = useReactiveListener({
+    rvmId: REACTIVE_CONTRACT_ADDRESS, // Update with correct RVM ID
     startTimestamp: orderCreatedTimestamp || 0,
     onTransaction: (tx: ReactiveTransaction) => {
       console.log('Reactive transaction detected:', tx);
@@ -117,15 +117,15 @@ export default function MarketMaker() {
         BigInt(amount),
       )
 
-      console.log({
-        l1BidId: Number(selectedBid.l1_BidId),
-        l1ChainId: Number(selectedBid.l1_ChainId),
-        l2TokenIn: selectedBid.tokenInfo.l2_TokenAddress,
-        l2TokenAmountIn: amount.toString(),
-        receiverL1Address: address,
-        fillRemaining,
-        tokenDecimals: token.decimals,
-      })
+      // console.log({
+      //   l1BidId: Number(selectedBid.l1_BidId),
+      //   l1ChainId: Number(selectedBid.l1_ChainId),
+      //   l2TokenIn: selectedBid.tokenInfo.l2_TokenAddress,
+      //   l2TokenAmountIn: amount.toString(),
+      //   receiverL1Address: address,
+      //   fillRemaining,
+      //   tokenDecimals: token.decimals,
+      // })
       await createL2Order({
         l1BidId: Number(selectedBid.l1_BidId),
         l1ChainId: Number(selectedBid.l1_ChainId),
@@ -385,6 +385,20 @@ export default function MarketMaker() {
             </TabsContent>
           </Tabs>
         )}
+
+         {isListening && (
+                  <div className="border-t pt-4 mt-4">
+                    <div className="text-xs text-muted-foreground uppercase mb-3">
+                      REACTIVE NETWORK MONITORING
+                    </div>
+                    <div className="flex items-center gap-2 p-3 rounded-lg bg-green-500/10 border border-green-500/20">
+                      <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                      <span className="text-sm text-green-600">
+                        Listening for cross-chain activity ({""} events)
+                      </span>
+                    </div>
+                  </div>
+                )}
       </div>
     </div>
   );

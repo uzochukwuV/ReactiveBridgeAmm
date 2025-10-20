@@ -1,3 +1,5 @@
+import { stringToHex } from "viem";
+
 const REACTIVE_RPC_URL = "https://lasna-rpc.rnk.dev/";
 
 export interface ReactiveTransaction {
@@ -28,6 +30,7 @@ export interface ReactiveLog {
 }
 
 async function rpcCall<T>(method: string, params: any[]): Promise<T> {
+
   const response = await fetch(REACTIVE_RPC_URL, {
     method: "POST",
     headers: {
@@ -42,6 +45,7 @@ async function rpcCall<T>(method: string, params: any[]): Promise<T> {
   });
 
   const json = await response.json();
+
   
   if (json.error) {
     throw new Error(json.error.message || "RPC call failed");
@@ -77,8 +81,8 @@ export async function getTransactionLogs(
   return rpcCall<ReactiveLog[]>("rnk_getTransactionLogs", [rvmId, txNumber]);
 }
 
-export async function getHeadNumber(rvmId: string): Promise<string> {
-  return rpcCall<string>("rnk_getHeadNumber", [rvmId]);
+export async function getHeadNumber(rvmId: string): Promise<any> {
+  return await (rpcCall<string>("rnk_getHeadNumber", [rvmId]));
 }
 
 export async function getTransactions(
@@ -86,11 +90,17 @@ export async function getTransactions(
   from: string,
   limit: string
 ): Promise<ReactiveTransaction[]> {
-  return rpcCall<ReactiveTransaction[]>("rnk_getTransactions", [
-    rvmId,
-    from,
-    limit,
+  
+  const rnkData = await getRnkAddressMapping(rvmId);
+  const headnimber = await getHeadNumber(rnkData!.rvmId)
+  console.log(headnimber)
+  const data = await rpcCall<ReactiveTransaction[]>("rnk_getTransactions", [
+    rnkData!.rvmId as any,
+    stringToHex(from),
+    stringToHex(limit)
   ]);
+  console.log(data);
+  return data
 }
 
 export async function getRnkAddressMapping(
